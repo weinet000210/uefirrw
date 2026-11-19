@@ -288,6 +288,20 @@ ScanPci (
     for (Bus = BusMin; Bus <= BusMax; Bus++) {
       for (Dev = 0; Dev <= PCI_MAX_DEVICE; Dev++) {
         for (Func = 0; Func <= PCI_MAX_FUNC; Func++) {
+          //
+          // Show the address before touching it: if a config read never
+          // completes on real hardware, the screen names the culprit.
+          //
+          UiStatus (
+            ATTR_HEADER,
+            L" Scanning PCI  %04X:%02X:%02X.%X   %d device(s) so far ",
+            (UINT32)Rb->SegmentNumber,
+            (UINT32)Bus,
+            (UINT32)Dev,
+            (UINT32)Func,
+            (UINT32)mDevCount
+            );
+          UiFlush ();
           if (EFI_ERROR (CfgRead (Rb, (UINT8)Bus, (UINT8)Dev, (UINT8)Func, 0, 4, &Id))) {
             break;
           }
