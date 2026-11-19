@@ -17,6 +17,7 @@
 
 #include "UefiRrw.h"
 #include <Protocol/GraphicsOutput.h>
+#include <Library/DevicePathLib.h>
 #include <Uefi/UefiInternalFormRepresentation.h>
 
 #define GLYPH_W      EFI_GLYPH_WIDTH
@@ -45,6 +46,18 @@ STATIC EFI_GRAPHICS_OUTPUT_BLT_PIXEL  *mRowBuf;     // one text row of pixels
 STATIC UINTN                          mScale = 1;
 STATIC UINTN                          mOriginX;
 STATIC UINTN                          mOriginY;
+
+//
+// Extra GOP instances that mirror the screen. Used when the console has no
+// GOP of its own (common on AMI with an add-in GPU next to an onboard BMC
+// VGA): we cannot tell which one has the monitor, so we draw on all of them.
+//
+#define MAX_MIRRORS  8
+STATIC EFI_GRAPHICS_OUTPUT_PROTOCOL   *mMirror[MAX_MIRRORS];
+STATIC UINTN                          mMirrorX[MAX_MIRRORS];
+STATIC UINTN                          mMirrorY[MAX_MIRRORS];
+STATIC BOOLEAN                        mMirrorOn[MAX_MIRRORS];
+STATIC UINTN                          mMirrorCount;
 STATIC CONST UINT8                    *mGlyph[128];
 
 STATIC INT32    mSavedMode = -1;
@@ -128,6 +141,20 @@ FillScreenPixels (
           mGop->Mode->Info->VerticalResolution,
           0
           );
+  for (UINTN Index = 0; Index < mMirrorCount; Index++) {
+    mMirror[Index]->Blt (
+                      mMirror[Index],
+                      &Color,
+                      EfiBltVideoFill,
+                      0,
+                      0,
+                      0,
+                      0,
+                      mMirror[Index]->Mode->Info->HorizontalResolution,
+                      mMirror[Index]->Mode->Info->VerticalResolution,
+                      0
+                      );
+  }
 }
 
 /**
@@ -152,6 +179,14 @@ SetupGrid (
     gScreenRows = MIN (VRes / (GLYPH_H * mScale), MAX_ROWS);
     mOriginX    = (HRes - gScreenCols * GLYPH_W * mScale) / 2;
     mOriginY    = (VRes - gScreenRows * GLYPH_H * mScale) / 2;
+    for (Index = 0; Index < mMirrorCount; Index++) {
+      HRes              = mMirror[Index]->Mode->Info->HorizontalResolution;
+      VRes              = mMirror[Index]->Mode->Info->VerticalResolution;
+      mMirrorOn[Index] = (HRes >= gScreenCols * GLYPH_W * mScale) && (VRes >= gScreenRows * GLYPH_H * mScale);
+      mMirrorX[Index]  = mMirrorOn[Index] ? (HRes - gScreenCols * GLYPH_W * mScale) / 2 : 0;
+      mMirrorY[Index]  = mMirrorOn[Index] ? (VRes - gScreenRows * GLYPH_H * mScale) / 2 : 0;
+    }
+
     if (mRowBuf != NULL) {
       FreePool (mRowBuf);
     }
@@ -230,6 +265,134 @@ SetupConOutMode (
   }
 }
 
+/**
+  TRUE when one device path is a leading part of the other (ignoring the
+  end nodes). ConOut entries name either the GPU or its output child.
+**/
+STATIC
+BOOLEAN
+PathsOverlap (
+  IN EFI_DEVICE_PATH_PROTOCOL  *A,
+  IN EFI_DEVICE_PATH_PROTOCOL  *B
+  )
+{
+  UINTN  SizeA;
+  UINTN  SizeB;
+
+  SizeA = GetDevicePathSize (A) - END_DEVICE_PATH_LENGTH;
+  SizeB = GetDevicePathSize (B) - END_DEVICE_PATH_LENGTH;
+  if ((SizeA == 0) || (SizeB == 0)) {
+    return FALSE;
+  }
+
+  return (BOOLEAN)(CompareMem (A, B, MIN (SizeA, SizeB)) == 0);
+}
+
+/**
+  The console has no GOP of its own: choose one physical GOP as the main
+  screen (the one ConOut names, else the largest) and mirror the rest.
+**/
+STATIC
+EFI_STATUS
+PickGop (
+  VOID
+  )
+{
+  EFI_STATUS                    Status;
+  EFI_HANDLE                    *Handles;
+  UINTN                         Count;
+  UINTN                         Index;
+  EFI_GRAPHICS_OUTPUT_PROTOCOL  *Gop;
+  EFI_GRAPHICS_OUTPUT_PROTOCOL  *Found[MAX_MIRRORS + 1];
+  BOOLEAN                       InConOut[MAX_MIRRORS + 1];
+  UINTN                         Num;
+  UINTN                         Best;
+  UINTN                         Area;
+  UINTN                         BestArea;
+  BOOLEAN                       BestInConOut;
+  EFI_DEVICE_PATH_PROTOCOL      *ConOut;
+  EFI_DEVICE_PATH_PROTOCOL      *Walk;
+  EFI_DEVICE_PATH_PROTOCOL      *Inst;
+  EFI_DEVICE_PATH_PROTOCOL      *Path;
+  UINTN                         InstSize;
+
+  mGop   = NULL;
+  ConOut = NULL;
+  GetEfiGlobalVariable2 (L"ConOut", (VOID **)&ConOut, NULL);
+
+  Status = gBS->LocateHandleBuffer (ByProtocol, &gEfiGraphicsOutputProtocolGuid, NULL, &Count, &Handles);
+  if (EFI_ERROR (Status)) {
+    if (ConOut != NULL) {
+      FreePool (ConOut);
+    }
+
+    return Status;
+  }
+
+  Num = 0;
+  for (Index = 0; (Index < Count) && (Num < MAX_MIRRORS + 1); Index++) {
+    if (EFI_ERROR (gBS->HandleProtocol (Handles[Index], &gEfiGraphicsOutputProtocolGuid, (VOID **)&Gop))) {
+      continue;
+    }
+
+    if ((Gop == NULL) || (Gop->Mode == NULL) || (Gop->Mode->Info == NULL) ||
+        (Gop->Mode->Info->HorizontalResolution == 0) || (Gop->Mode->Info->VerticalResolution == 0))
+    {
+      continue;
+    }
+
+    InConOut[Num] = FALSE;
+    Path          = DevicePathFromHandle (Handles[Index]);
+    if ((Path != NULL) && (ConOut != NULL)) {
+      Walk = ConOut;
+      while (Walk != NULL) {
+        Inst = GetNextDevicePathInstance (&Walk, &InstSize);
+        if (Inst == NULL) {
+          break;
+        }
+
+        if (PathsOverlap (Inst, Path)) {
+          InConOut[Num] = TRUE;
+        }
+
+        FreePool (Inst);
+      }
+    }
+
+    Found[Num++] = Gop;
+  }
+
+  FreePool (Handles);
+  if (ConOut != NULL) {
+    FreePool (ConOut);
+  }
+
+  if (Num == 0) {
+    return EFI_NOT_FOUND;
+  }
+
+  Best         = 0;
+  BestArea     = 0;
+  BestInConOut = FALSE;
+  for (Index = 0; Index < Num; Index++) {
+    Area = Found[Index]->Mode->Info->HorizontalResolution * Found[Index]->Mode->Info->VerticalResolution;
+    if ((InConOut[Index] && !BestInConOut) || ((InConOut[Index] == BestInConOut) && (Area > BestArea))) {
+      Best         = Index;
+      BestArea     = Area;
+      BestInConOut = InConOut[Index];
+    }
+  }
+
+  mGop = Found[Best];
+  for (Index = 0; Index < Num; Index++) {
+    if (Index != Best) {
+      mMirror[mMirrorCount++] = Found[Index];
+    }
+  }
+
+  return EFI_SUCCESS;
+}
+
 VOID
 UiInit (
   VOID
@@ -248,13 +411,15 @@ UiInit (
 
   BuildGlyphMap ();
 
-  Status = gBS->HandleProtocol (gST->ConsoleOutHandle, &gEfiGraphicsOutputProtocolGuid, (VOID **)&mGop);
-  if (EFI_ERROR (Status)) {
-    Status = gBS->LocateProtocol (&gEfiGraphicsOutputProtocolGuid, NULL, (VOID **)&mGop);
+  mMirrorCount = 0;
+  Status       = gBS->HandleProtocol (gST->ConsoleOutHandle, &gEfiGraphicsOutputProtocolGuid, (VOID **)&mGop);
+  if (EFI_ERROR (Status) || (mGop == NULL) || (mGop->Mode == NULL) || (mGop->Mode->Info == NULL)) {
+    Status = PickGop ();
   }
 
   if (EFI_ERROR (Status) || (mGop == NULL) || (mGop->Mode == NULL) || (mGop->Mode->Info == NULL)) {
-    mGop = NULL;
+    mGop         = NULL;
+    mMirrorCount = 0;
   }
 
   if (mGop != NULL) {
@@ -267,7 +432,8 @@ UiInit (
     //
     // Out of memory with GOP buffers: fall back to plain ConOut.
     //
-    mGop = NULL;
+    mGop         = NULL;
+    mMirrorCount = 0;
     SetupConOutMode ();
     SetupGrid ();
   }
@@ -430,6 +596,24 @@ GopDrawSpan (
           PixH,
           PixW * sizeof (EFI_GRAPHICS_OUTPUT_BLT_PIXEL)
           );
+  for (Col = 0; Col < mMirrorCount; Col++) {
+    if (!mMirrorOn[Col]) {
+      continue;
+    }
+
+    mMirror[Col]->Blt (
+                    mMirror[Col],
+                    mRowBuf,
+                    EfiBltBufferToVideo,
+                    0,
+                    0,
+                    mMirrorX[Col] + First * GLYPH_W * mScale,
+                    mMirrorY[Col] + Row * PixH,
+                    PixW,
+                    PixH,
+                    PixW * sizeof (EFI_GRAPHICS_OUTPUT_BLT_PIXEL)
+                    );
+  }
 }
 
 STATIC
